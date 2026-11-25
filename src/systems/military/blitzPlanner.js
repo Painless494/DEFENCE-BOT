@@ -1,202 +1,273 @@
 // ============================================================
 // src/systems/military/blitzPlanner.js
-// Automatically pairs your members with enemy targets
-// based on war range, prioritizing dangerous targets first
+//
+// Automatic blitz planner.
+//
+// Goal: give EVERY enemy member attackers, spread the work across
+// our members as evenly as possible, never break war range, and
+// put our strongest members on the most dangerous enemies.
+//
+// How it works (layered min-cost max-flow):
+//   Layer 1: every enemy gets ONE attacker
+//   Layer 2: every enemy gets a SECOND attacker  ... up to N
+//   Each layer is solved optimally. The cost of using a member
+//   rises steeply with every target they already hold, so members
+//   with no assignment are always preferred over ones that already
+//   have one. Among equally-loaded members the best matchup wins,
+//   and matchup quality counts more for dangerous enemies.
 // ============================================================
 
-const { getAllianceMembers, resolveAlliance } = require('../../utils/pwApi');
-const { calculateNationReadiness, getReadinessWeights, PER_CITY } = require('../../utils/mmrCalculator');
+const { getAllianceMembers } = require('../../utils/pwApi');
+const { inWarRange, attackerRange, WAR_RANGE } = require('../../utils/warRange');
 
-// ============================================================
-// SCORE A TARGET — higher score = higher priority to hit
-// We want to hit the most dangerous enemies first
-// ============================================================
-function scoreThreat(nation) {
-  let threat = 0;
+const MAX_OFFENSIVE_SLOTS = 5;
+const MAX_DEFENSIVE_SLOTS = 3;
+const INACTIVE_DAYS       = 7;
 
-  // More cities = more infrastructure = higher priority
-  threat += (nation.num_cities || 0) * 10;
+// Cost scale. LOAD_STEP dwarfs any matchup cost, which makes
+// "spread the load" a hard priority and "best matchup" the tie-breaker.
+const LOAD_STEP = 100000;
+const MATCH_W   = 100;   // 0..100 base cost for a bad matchup
+const COVER_W   = 4000;  // bonus for covering dangerous targets first
 
-  // Strong air force is the biggest threat in P&W
-  const maxAircraft = (nation.num_cities || 1) * PER_CITY.aircraft;
-  const aircraftFill = (nation.aircraft || 0) / maxAircraft;
-  threat += aircraftFill * 40;
+const num = v => Number(v) || 0;
 
-  // Nukes and missiles are very dangerous
-  threat += (nation.nukes    || 0) * 15;
-  threat += (nation.missiles || 0) * 3;
+// ── Combat maths ─────────────────────────────────────────────
+// P&W ground value: armed soldier 1.75, tank 40 (wiki "War")
+const groundPower = n => num(n.soldiers) * 1.75 + num(n.tanks) * 40;
+const ratio = (a, b) => (a + b === 0 ? 0.5 : a / (a + b));
 
-  // High score = stronger nation overall
-  threat += Math.min((nation.score || 0) / 100, 30);
+// 0..1 — how well `att` matches up against `tgt`
+function advantage(att, tgt) {
+  return 0.45 * ratio(num(att.aircraft), num(tgt.aircraft)) +
+         0.35 * ratio(groundPower(att), groundPower(tgt)) +
+         0.20 * ratio(num(att.ships),    num(tgt.ships));
+}
 
-  // Tank fill rate
-  const maxTanks = (nation.num_cities || 1) * PER_CITY.tanks;
-  const tankFill = (nation.tanks || 0) / maxTanks;
-  threat += tankFill * 20;
+function computeThreats(targets) {
+  const max = {
+    air:    Math.max(1, ...targets.map(t => num(t.aircraft))),
+    ground: Math.max(1, ...targets.map(t => groundPower(t))),
+    ships:  Math.max(1, ...targets.map(t => num(t.ships))),
+    cities: Math.max(1, ...targets.map(t => num(t.num_cities))),
+  };
+  for (const t of targets) {
+    const raw =
+      0.35 * (num(t.aircraft) / max.air) +
+      0.25 * (groundPower(t)  / max.ground) +
+      0.10 * (num(t.ships)    / max.ships) +
+      0.10 * (num(t.num_cities) / max.cities) +
+      0.10 * Math.min(num(t.missiles) / 10, 1) +
+      0.10 * Math.min(num(t.nukes) / 3, 1);
+    t.threatRaw = Math.max(0, Math.min(1, raw));
+    t.threat    = Math.round(t.threatRaw * 100);
+  }
+}
 
-  // Already has open def slots = easier to slot them in
-  const openDefSlots = 3 - (nation.defensive_wars_count || 0);
-  if (openDefSlots > 0) threat += openDefSlots * 5;
+// ── Min-cost max-flow (successive shortest paths, SPFA) ──────
+class MinCostFlow {
+  constructor(n) {
+    this.n = n;
+    this.g = Array.from({ length: n }, () => []);
+    this.e = [];
+  }
+  addEdge(u, v, cap, cost) {
+    this.g[u].push(this.e.length); this.e.push({ to: v, cap, cost });
+    this.g[v].push(this.e.length); this.e.push({ to: u, cap: 0, cost: -cost });
+    return this.e.length - 2;
+  }
+  run(s, t) {
+    let flow = 0;
+    for (;;) {
+      const dist = new Array(this.n).fill(Infinity);
+      const inq  = new Array(this.n).fill(false);
+      const prev = new Array(this.n).fill(-1);
+      dist[s] = 0;
+      const q = [s];
+      for (let qi = 0; qi < q.length; qi++) {
+        const u = q[qi]; inq[u] = false;
+        for (const id of this.g[u]) {
+          const ed = this.e[id];
+          if (ed.cap > 0 && dist[u] + ed.cost < dist[ed.to]) {
+            dist[ed.to] = dist[u] + ed.cost;
+            prev[ed.to] = id;
+            if (!inq[ed.to]) { inq[ed.to] = true; q.push(ed.to); }
+          }
+        }
+      }
+      if (dist[t] === Infinity) break;
+      let f = Infinity;
+      for (let v = t; v !== s; v = this.e[prev[v] ^ 1].to) f = Math.min(f, this.e[prev[v]].cap);
+      for (let v = t; v !== s; v = this.e[prev[v] ^ 1].to) {
+        this.e[prev[v]].cap     -= f;
+        this.e[prev[v] ^ 1].cap += f;
+      }
+      flow += f;
+    }
+    return flow;
+  }
+}
 
-  // Bonus for government members (inferred from score/cities)
-  if ((nation.num_cities || 0) >= 20) threat += 20;
-
-  return Math.round(threat);
+// ── Helpers ──────────────────────────────────────────────────
+function daysSince(lastActive, now) {
+  if (!lastActive) return 0;
+  let s = String(lastActive).trim().replace(' ', 'T');
+  if (!/(Z|[+-]\d\d:?\d\d)$/.test(s)) s += 'Z';
+  const t = Date.parse(s);
+  return isNaN(t) ? 0 : (now - t) / 86400000;
 }
 
 // ============================================================
-// SCORE AN ATTACKER'S SUITABILITY FOR A TARGET
-// Higher = better match
+// PURE PLANNER — no API calls, easy to test
 // ============================================================
-function scoreAttackerSuitability(attacker, target, weights) {
-  let suitability = 0;
+function buildPlan(ourMembers, enemyMembers, attackersPerTarget = 3, options = {}) {
+  const opts = { maxPerMember: MAX_OFFENSIVE_SLOTS, includeBeige: false, now: Date.now(), ...options };
+  const k    = Math.max(1, Math.min(5, parseInt(attackersPerTarget) || 3));
+  const capLimit = Math.max(1, Math.min(MAX_OFFENSIVE_SLOTS, parseInt(opts.maxPerMember) || MAX_OFFENSIVE_SLOTS));
 
-  // Check if in range (required — this is a hard filter)
-  // War range: attacker.score must be within target.score/1.5 to target.score/0.75
-  const minScore = target.score / 1.5;
-  const maxScore = target.score / 0.75;
-  if (attacker.score < minScore || attacker.score > maxScore) return -1;
+  // ── Our attacker pool ──────────────────────────────────────
+  const pool = [];
+  const excludedMembers = [];
+  for (const m of ourMembers) {
+    const reason =
+      num(m.vacation_mode_turns) > 0 ? 'On vacation mode' :
+      daysSince(m.last_active, opts.now) > INACTIVE_DAYS ? `Inactive for more than ${INACTIVE_DAYS} days` :
+      (num(m.soldiers) + num(m.tanks) + num(m.aircraft) + num(m.ships)) === 0 ? 'No military units' :
+      num(m.offensive_wars_count) >= MAX_OFFENSIVE_SLOTS ? 'No open offensive slots' : null;
+    if (reason) { excludedMembers.push({ member: m, reason }); continue; }
+    const openSlots = MAX_OFFENSIVE_SLOTS - num(m.offensive_wars_count);
+    pool.push({ ...m, openSlots, cap: Math.min(openSlots, capLimit), load: 0, matches: [] });
+  }
 
-  // Skip if no open offensive slots
-  if ((attacker.offensive_wars_count || 0) >= 5) return -1;
+  // ── Enemy targets ──────────────────────────────────────────
+  const targets = [];
+  const skippedTargets = [];
+  for (const m of enemyMembers) {
+    const reason =
+      num(m.vacation_mode_turns) > 0 ? 'On vacation mode' :
+      (!opts.includeBeige && num(m.beige_turns) > 0) ? `In beige (${num(m.beige_turns) * 2}h left)` :
+      num(m.defensive_wars_count) >= MAX_DEFENSIVE_SLOTS ? 'Already has 3 defensive wars' : null;
+    if (reason) { skippedTargets.push({ target: m, reason }); continue; }
+    const openDefSlots = MAX_DEFENSIVE_SLOTS - num(m.defensive_wars_count);
+    targets.push({ ...m, openDefSlots, need: Math.min(k, openDefSlots), assigned: [], assignedIds: new Set() });
+  }
+  computeThreats(targets);
+  targets.sort((a, b) => b.threat - a.threat || num(b.score) - num(a.score));
+  targets.forEach((t, i) => { t.priority = i + 1; });
 
-  // Skip vacation mode
-  if ((attacker.vacation_mode_turns || 0) > 0) return -1;
+  // ── Layered assignment ─────────────────────────────────────
+  for (let layer = 1; layer <= k; layer++) {
+    const atts = pool.filter(a => a.load < a.cap);
+    const tgts = targets.filter(t => t.assigned.length < Math.min(layer, t.need));
+    if (atts.length === 0 || tgts.length === 0) continue;
 
-  // Prefer attackers closer to the target's score (better matchup)
-  const scoreDiff = Math.abs(attacker.score - target.score) / target.score;
-  suitability += (1 - scoreDiff) * 30;
+    const S = 0, T = 1, A0 = 2, T0 = 2 + atts.length;
+    const net = new MinCostFlow(2 + atts.length + tgts.length);
 
-  // Prefer attackers with more open slots (versatile)
-  suitability += (5 - (attacker.offensive_wars_count || 0)) * 5;
+    // source -> attacker: one arc per remaining slot, each pricier than the last
+    atts.forEach((a, i) => {
+      for (let s = 0; s < a.cap - a.load; s++) net.addEdge(S, A0 + i, 1, LOAD_STEP * (a.load + s));
+    });
 
-  // Prefer attackers with higher readiness
-  const readiness = calculateNationReadiness(attacker, weights);
-  suitability += readiness.total * 0.3;
+    // attacker -> target (only legal, not-yet-used pairings)
+    const pairEdges = [];
+    atts.forEach((a, i) => {
+      tgts.forEach((t, j) => {
+        if (t.assignedIds.has(a.id)) return;
+        if (!inWarRange(a.score, t.score)) return;               // WAR RANGE RULE
+        const adv   = advantage(a, t);
+        const match = Math.round((1 - adv) * MATCH_W * (1 + 1.5 * t.threatRaw) * 10);
+        const cover = Math.round((1 - t.threatRaw) * COVER_W);
+        const id = net.addEdge(A0 + i, T0 + j, 1, match + cover);
+        pairEdges.push({ id, a, t, adv });
+      });
+    });
 
-  // Prefer attackers with stronger aircraft (air superiority matters)
-  const maxAircraft = (attacker.num_cities || 1) * PER_CITY.aircraft;
-  const aircraftFill = (attacker.aircraft || 0) / maxAircraft;
-  suitability += aircraftFill * 20;
+    tgts.forEach((t, j) => net.addEdge(T0 + j, T, 1, 0));
+    net.run(S, T);
 
-  return Math.round(suitability);
+    for (const pe of pairEdges) {
+      if (net.e[pe.id].cap === 0) {            // flow went through this pairing
+        pe.t.assigned.push({ ...pe.a, advantage: pe.adv });
+        pe.t.assignedIds.add(pe.a.id);
+        pe.a.load++;
+        pe.a.matches.push({ target: pe.t, advantage: pe.adv });
+      }
+    }
+  }
+
+  // ── Build results ──────────────────────────────────────────
+  const assignments = targets.map(t => {
+    t.assigned.sort((x, y) => y.advantage - x.advantage);
+    return {
+      target: t,
+      attackers: t.assigned.map(a => ({ ...a, load: pool.find(p => p.id === a.id)?.load || 1 })),
+      neededAttackers: t.need,
+      fullySlotted: t.assigned.length >= t.need,
+    };
+  });
+
+  const unmatched = [];
+  const uncovered = [];
+  for (const a of assignments) {
+    if (a.attackers.length >= a.neededAttackers) continue;
+    const inRange = pool.filter(p => inWarRange(p.score, a.target.score));
+    const rng = attackerRange(a.target.score);
+    const reason = inRange.length === 0
+      ? `No active member in range (needs NS ${Math.round(rng.min).toLocaleString()}–${Math.round(rng.max).toLocaleString()})`
+      : `In-range members are already at their assignment limit`;
+    a.shortReason = reason;
+    unmatched.push({ target: a.target, assigned: a.attackers.length, needed: a.neededAttackers, reason });
+    if (a.attackers.length === 0) uncovered.push({ target: a.target, reason });
+  }
+
+  const unusedMembers = pool.filter(p => p.load === 0).map(p => ({
+    ...p,
+    reason: targets.some(t => inWarRange(p.score, t.score))
+      ? 'Surplus — every target already has its attackers'
+      : 'No enemy target in war range',
+  }));
+
+  const byMember = pool.filter(p => p.load > 0)
+    .map(p => ({ member: p, targets: p.matches }))
+    .sort((x, y) => y.member.load - x.member.load || num(y.member.score) - num(x.member.score));
+
+  const loads = pool.map(p => p.load);
+  const totalAssignments = loads.reduce((s, v) => s + v, 0);
+  const fullySlottedCount = assignments.filter(a => a.fullySlotted).length;
+  const coveredCount = assignments.filter(a => a.attackers.length > 0).length;
+
+  return {
+    options: { attackersPerTarget: k, maxPerMember: capLimit, includeBeige: opts.includeBeige },
+    warRange: { min: WAR_RANGE.MIN_RATIO, max: WAR_RANGE.MAX_RATIO },
+    ourMemberCount: pool.length,
+    enemyMemberCount: targets.length,
+    totalTargets: targets.length,
+    assignments, unmatched, uncovered, unusedMembers, excludedMembers, skippedTargets, byMember,
+    totalAssignments, fullySlottedCount, coveredCount,
+    coverage:    targets.length ? Math.round((fullySlottedCount / targets.length) * 100) : 0,
+    coverageAny: targets.length ? Math.round((coveredCount / targets.length) * 100) : 0,
+    loadStats: {
+      used: loads.filter(v => v > 0).length,
+      idle: loads.filter(v => v === 0).length,
+      max:  loads.length ? Math.max(...loads) : 0,
+      min:  loads.length ? Math.min(...loads) : 0,
+      avgUsed: loads.filter(v => v > 0).length
+        ? totalAssignments / loads.filter(v => v > 0).length : 0,
+    },
+    attackersPerTarget: k,
+  };
 }
 
 // ============================================================
-// MAIN PLANNER — pairs members to targets
-// Returns an attack plan with assignments and unmatched lists
+// Public entry point — fetches both rosters, then plans
 // ============================================================
-async function planBlitz(guildId, ourAllianceId, enemyAllianceId, attackersPerTarget = 3) {
-  // Fetch both alliances in parallel
+async function planBlitz(guildId, ourAllianceId, enemyAllianceId, attackersPerTarget = 3, options = {}) {
   const [ourMembers, enemyMembers] = await Promise.all([
     getAllianceMembers(ourAllianceId),
     getAllianceMembers(enemyAllianceId),
   ]);
-
-  const weights = getReadinessWeights(guildId);
-
-  // Filter our members — only active, available members
-  const availableAttackers = ourMembers
-    .filter(m =>
-      m.vacation_mode_turns === 0 &&
-      (m.offensive_wars_count || 0) < 5
-    )
-    .map(m => ({
-      ...m,
-      openSlots: 5 - (m.offensive_wars_count || 0),
-      slotsUsed: 0, // Track how many we assign in this plan
-    }));
-
-  // Filter enemy — only members with open defensive slots
-  const validTargets = enemyMembers
-    .filter(m =>
-      m.vacation_mode_turns === 0 &&
-      (m.defensive_wars_count || 0) < 3 // max 3 def wars
-    )
-    .map(m => ({
-      ...m,
-      threatScore: scoreThreat(m),
-      openDefSlots: 3 - (m.defensive_wars_count || 0),
-      assignedAttackers: [],
-    }))
-    .sort((a, b) => b.threatScore - a.threatScore); // Highest threat first
-
-  // Track attacker slot usage
-  const attackerMap = new Map(availableAttackers.map(a => [a.id, { ...a }]));
-
-  const assignments   = []; // Successfully paired targets
-  const unmatched     = []; // Targets we couldn't fill
-  const unusedMembers = []; // Our members with no assignment
-
-  // ── ASSIGNMENT LOOP ───────────────────────────────────────
-  for (const target of validTargets) {
-    const neededAttackers = Math.min(attackersPerTarget, target.openDefSlots);
-    const assignedToTarget = [];
-
-    // Score every available attacker against this target
-    const candidates = [];
-    for (const [id, attacker] of attackerMap) {
-      if (attacker.slotsUsed >= attacker.openSlots) continue; // No slots left
-
-      const suit = scoreAttackerSuitability(attacker, target, weights);
-      if (suit >= 0) {
-        candidates.push({ ...attacker, suitability: suit });
-      }
-    }
-
-    // Sort by suitability descending
-    candidates.sort((a, b) => b.suitability - a.suitability);
-
-    // Assign top N candidates
-    for (const candidate of candidates.slice(0, neededAttackers)) {
-      assignedToTarget.push(candidate);
-      // Update slot usage
-      const atk = attackerMap.get(candidate.id);
-      if (atk) atk.slotsUsed++;
-    }
-
-    assignments.push({
-      target,
-      attackers: assignedToTarget,
-      fullySlotted: assignedToTarget.length >= neededAttackers,
-      neededAttackers,
-    });
-
-    if (assignedToTarget.length < neededAttackers) {
-      unmatched.push({
-        target,
-        assigned: assignedToTarget.length,
-        needed: neededAttackers,
-      });
-    }
-  }
-
-  // Find our members who weren't assigned anything
-  for (const [id, attacker] of attackerMap) {
-    if (attacker.slotsUsed === 0) {
-      unusedMembers.push(attacker);
-    }
-  }
-
-  // Stats
-  const totalAssignments  = assignments.reduce((s, a) => s + a.attackers.length, 0);
-  const fullySlottedCount = assignments.filter(a => a.fullySlotted).length;
-  const coverage          = validTargets.length > 0
-    ? Math.round((fullySlottedCount / validTargets.length) * 100)
-    : 0;
-
-  return {
-    ourMemberCount:    availableAttackers.length,
-    enemyMemberCount:  validTargets.length,
-    totalTargets:      validTargets.length,
-    assignments,
-    unmatched,
-    unusedMembers,
-    totalAssignments,
-    fullySlottedCount,
-    coverage,
-    attackersPerTarget,
-  };
+  return buildPlan(ourMembers, enemyMembers, attackersPerTarget, options);
 }
 
-module.exports = { planBlitz, scoreThreat };
+module.exports = { planBlitz, buildPlan, advantage, groundPower };
